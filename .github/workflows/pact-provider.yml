@@ -1,0 +1,106 @@
+name: Inventory Pact Provider
+
+on:
+  repository_dispatch:
+    types: [verify-pact]
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '18'
+  ORG_NAME: abcdigital-org
+  CONTRACTS_REPO: contracts-repo
+  PACT_SUBDIR: inventory-service
+  STATUS_CONTEXT: provider/inventory/pact
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout provider
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Clone contracts repository
+        env:
+          PAT: ${{ secrets.CONTRACT_PAT }}
+          PACT_BRANCH: ${{ github.event.client_payload.pact_branch }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "CONTRACT_PAT secret is required" >&2
+            exit 1
+          fi
+          git clone https://x-access-token:${PAT}@github.com/${ORG_NAME}/${CONTRACTS_REPO}.git contracts
+          cd contracts
+          if [ -n "$PACT_BRANCH" ]; then
+            git fetch origin "$PACT_BRANCH":"$PACT_BRANCH"
+            git checkout "$PACT_BRANCH"
+          else
+            git checkout main
+          fi
+
+      - name: Prepare pact payload
+        run: |
+          rm -rf pacts
+          mkdir -p pacts
+          shopt -s nullglob
+          files=(contracts/pacts/${PACT_SUBDIR}/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No pact files found in contracts/pacts/${PACT_SUBDIR}." >&2
+            exit 1
+          fi
+          cp "${files[@]}" pacts/
+          echo "Copied ${#files[@]} pact file(s)."
+
+      - name: Run provider verification
+        id: verification
+        continue-on-error: true
+        run: npm run test:provider
+
+      - name: Report verification result
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.STATUS_PAT }}
+          CONSUMER_REPO: ${{ github.event.client_payload.consumer_repo }}
+          CONSUMER_SHA: ${{ github.event.client_payload.consumer_sha }}
+          OUTCOME: ${{ steps.verification.outcome }}
+        run: |
+          if [ -z "$CONSUMER_REPO" ] || [ -z "$CONSUMER_SHA" ]; then
+            echo "Consumer repo metadata missing; skipping status update." >&2
+            exit 0
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "STATUS_PAT secret missing; cannot update consumer commit status." >&2
+            exit 0
+          fi
+          state=success
+          description='Inventory provider verification succeeded'
+          if [ "$OUTCOME" != 'success' ]; then
+            state=failure
+            description='Inventory provider verification failed'
+          fi
+          gh api repos/${CONSUMER_REPO}/statuses/${CONSUMER_SHA} \
+            -f state=$state \
+            -f context=${STATUS_CONTEXT} \
+            -f description="$description" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Fail job if verification failed
+        if: steps.verification.outcome != 'success'
+        run: |
+          echo "Provider verification failed." >&2
+          exit 1

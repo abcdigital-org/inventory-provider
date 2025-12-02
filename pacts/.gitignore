@@ -1,0 +1,2 @@
+# Pact files are downloaded from the contracts repository during verification
+*.json
